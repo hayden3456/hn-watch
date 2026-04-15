@@ -1,12 +1,12 @@
 # HN-Watch
 
-HN-Watch is a small cross-platform CLI that watches a Hacker News item page and alerts you when the post gets new comments or more points.
+HN-Watch is a small cross-platform CLI that watches a Hacker News item and alerts you when the post gets new comments or more points.
 
 It is built with:
 
 - Python
 - `requests`
-- `BeautifulSoup`
+- the official Hacker News Firebase API
 
 It works on:
 
@@ -96,7 +96,7 @@ hn-watch
 Useful options:
 
 ```bash
-hn-watch --url "https://news.ycombinator.com/item?id=47779274" --interval 60
+hn-watch --url "https://news.ycombinator.com/item?id=47779274" --interval 30
 hn-watch --url "https://news.ycombinator.com/item?id=47779274" --timeout 15
 hn-watch --url "https://news.ycombinator.com/item?id=47779274" --show-unchanged
 ```
@@ -105,19 +105,18 @@ hn-watch --url "https://news.ycombinator.com/item?id=47779274" --show-unchanged
 
 ```text
 Watching https://news.ycombinator.com/item?id=47779274
-Polling every 60 seconds
+Polling HN updates every 30 seconds
 Baseline: Making Wax Sealed Letters at Scale | Hacker News | comments=3 | points=1
 [ALERT] HN-Watch Alert: Comments: 3 -> 4 (+1)
 ```
 
 ## How It Works
 
-1. HN-Watch fetches the Hacker News item page with `requests`.
-2. It parses the HTML with `BeautifulSoup`.
-3. It reads the post's current point count and comment count from the page.
-4. It sleeps for the configured interval.
-5. It fetches the page again and compares the new counts to the previous snapshot.
-6. If points or comments increased, it sends a notification.
+1. HN-Watch fetches the target item from the official Hacker News API.
+2. It stores the current comment count and point count.
+3. It polls the HN `updates` feed on the configured interval.
+4. It only refetches the target item if HN reports that the item changed.
+5. If points or comments increased, it sends a notification.
 
 ## Important Notes
 
@@ -125,6 +124,7 @@ Baseline: Making Wax Sealed Letters at Scale | Hacker News | comments=3 | points
 - It does not watch the HN front page, user pages, or external sites.
 - It tracks increases in points and comments only.
 - A URL with an anchor is fine. HN-Watch ignores the `#...` fragment and watches the underlying item page.
+- HN-Watch uses the official HN API instead of scraping the HTML page, which avoids the `429 Too Many Requests` problem you can hit when polling `news.ycombinator.com` directly.
 
 ## Help
 

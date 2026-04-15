@@ -1,40 +1,30 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import platform
-import re
 import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 import requests
-from bs4 import BeautifulSoup
 
 from hn_watch import __version__
 
 
-COMMENT_PATTERNS = [
-    r"(\d[\d,]*)\s+comments?\b",
-    r"\bcomments?\s*[:\-]?\s*(\d[\d,]*)",
-]
-
-SCORE_PATTERNS = [
-    r"(\d[\d,]*)\s+(?:points?|score)\b",
-]
+API_BASE = "https://hacker-news.firebaseio.com/v0"
 
 
 @dataclass
-class PageSnapshot:
+class ItemSnapshot:
     url: str
+    item_id: int
     title: str
-    comment_count: Optional[int]
-    score_count: Optional[int]
-    body_hash: str
+    comment_count: int
+    score_count: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,12 +32,12 @@ def parse_args() -> argparse.Namespace:
         prog="hn-watch",
         description="Watch a Hacker News item URL and notify when comments or points increase.",
     )
-    parser.add_argument("--url", help="Page URL to watch.")
+    parser.add_argument("--url", help="Hacker News item URL to watch.")
     parser.add_argument(
         "--interval",
         type=int,
-        default=60,
-        help="Polling interval in seconds. Default: 60",
+        default=30,
+        help="Polling interval for the HN updates feed in seconds. Default: 30",
     )
     parser.add_argument(
         "--timeout",
@@ -85,82 +75,70 @@ def prompt_for_url() -> str:
 
 
 def normalize_url(url: str) -> str:
-    if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+    if not url.startswith(("http://", "https://")):
         url = f"https://{url}"
 
     parsed = urlparse(url)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, parsed.query, ""))
 
 
-def validate_hn_item_url(url: str) -> str:
+def parse_hn_item(url: str) -> tuple[str, int]:
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
     if parsed.netloc.lower() != "news.ycombinator.com" or parsed.path != "/item" or "id" not in query:
         raise SystemExit("HN-Watch only supports Hacker News item URLs like https://news.ycombinator.com/item?id=12345")
-    return url
+
+    try:
+        item_id = int(query["id"][0])
+    except (ValueError, IndexError) as exc:
+        raise SystemExit("The Hacker News item URL is missing a valid numeric id.") from exc
+
+    canonical_url = f"https://news.ycombinator.com/item?id={item_id}"
+    return canonical_url, item_id
 
 
-def fetch_snapshot(url: str, timeout: int, user_agent: str) -> PageSnapshot:
-    response = requests.get(
-        url,
-        timeout=timeout,
-        headers={"User-Agent": user_agent},
+def build_session(user_agent: str) -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": user_agent,
+            "Accept": "application/json",
+        }
     )
+    return session
+
+
+def fetch_json(session: requests.Session, url: str, timeout: int) -> Any:
+    response = session.get(url, timeout=timeout)
     response.raise_for_status()
+    return response.json()
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    title = soup.title.get_text(strip=True) if soup.title else url
-    comment_count, score_count = extract_hacker_news_metrics(url, soup)
-    body_hash = hashlib.sha256(response.text.encode("utf-8")).hexdigest()
 
-    return PageSnapshot(
-        url=url,
+def fetch_item_snapshot(session: requests.Session, item_id: int, timeout: int) -> ItemSnapshot:
+    payload = fetch_json(session, f"{API_BASE}/item/{item_id}.json", timeout)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Unexpected item payload for item {item_id}")
+
+    title = payload.get("title") or f"HN item {item_id}"
+    comment_count = int(payload.get("descendants") or 0)
+    score_count = int(payload.get("score") or 0)
+
+    return ItemSnapshot(
+        url=f"https://news.ycombinator.com/item?id={item_id}",
+        item_id=item_id,
         title=title,
         comment_count=comment_count,
         score_count=score_count,
-        body_hash=body_hash,
     )
 
 
-def extract_hacker_news_metrics(url: str, soup: BeautifulSoup) -> tuple[Optional[int], Optional[int]]:
-    parsed = urlparse(url)
-    query = parse_qs(parsed.query)
-    if parsed.netloc.lower() != "news.ycombinator.com" or parsed.path != "/item" or "id" not in query:
-        raise ValueError("Not a Hacker News item URL")
-
-    score_count: Optional[int] = None
-    score_node = soup.select_one("span.score")
-    if score_node:
-        score_count = extract_metric([score_node.get_text(" ", strip=True)], SCORE_PATTERNS)
-
-    comment_count: Optional[int] = None
-    subtext = soup.select_one("td.subtext, span.subline")
-    if subtext:
-        for link in subtext.select('a[href^="item?id="]'):
-            text = link.get_text(" ", strip=True)
-            count = extract_metric([text], COMMENT_PATTERNS)
-            if count is not None:
-                comment_count = count
-                break
-
-    return comment_count, score_count
+def fetch_changed_items(session: requests.Session, timeout: int) -> set[int]:
+    payload = fetch_json(session, f"{API_BASE}/updates.json", timeout)
+    items = payload.get("items", []) if isinstance(payload, dict) else []
+    return {int(item_id) for item_id in items}
 
 
-def extract_metric(text_chunks: list[str], patterns: list[str]) -> Optional[int]:
-    values: list[int] = []
-    for text in text_chunks:
-        for pattern in patterns:
-            for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-                raw_value = next((group for group in match.groups() if group), None)
-                if raw_value:
-                    try:
-                        values.append(int(raw_value.replace(",", "")))
-                    except ValueError:
-                        continue
-    return max(values) if values else None
-
-
-def describe_changes(old: PageSnapshot, new: PageSnapshot) -> list[str]:
+def describe_changes(old: ItemSnapshot, new: ItemSnapshot) -> list[str]:
     changes: list[str] = []
 
     comment_delta = delta_string("Comments", old.comment_count, new.comment_count)
@@ -171,14 +149,11 @@ def describe_changes(old: PageSnapshot, new: PageSnapshot) -> list[str]:
     if score_delta:
         changes.append(score_delta)
 
-    if not changes and old.body_hash != new.body_hash:
-        changes.append("The HN item changed, but comments and points did not increase.")
-
     return changes
 
 
-def delta_string(label: str, old: Optional[int], new: Optional[int]) -> Optional[str]:
-    if old is None or new is None or new <= old:
+def delta_string(label: str, old: int, new: int) -> str | None:
+    if new <= old:
         return None
     return f"{label}: {old} -> {new} (+{new - old})"
 
@@ -252,28 +227,35 @@ def escape_applescript(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def status_line(snapshot: PageSnapshot) -> str:
-    parts = [snapshot.title]
-    if snapshot.comment_count is not None:
-        parts.append(f"comments={snapshot.comment_count}")
-    if snapshot.score_count is not None:
-        parts.append(f"points={snapshot.score_count}")
-    return " | ".join(parts)
+def status_line(snapshot: ItemSnapshot) -> str:
+    return f"{snapshot.title} | comments={snapshot.comment_count} | points={snapshot.score_count}"
+
+
+def next_backoff_seconds(error: requests.RequestException, interval: int) -> int:
+    response = getattr(error, "response", None)
+    if response is not None and response.status_code == 429:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after and retry_after.isdigit():
+            return max(interval, int(retry_after))
+        return max(interval * 2, 60)
+    return interval
 
 
 def run() -> int:
     args = parse_args()
 
-    url = validate_hn_item_url(normalize_url(args.url or prompt_for_url()))
-    if args.interval < 5:
-        raise SystemExit("--interval must be at least 5 seconds.")
+    url, item_id = parse_hn_item(normalize_url(args.url or prompt_for_url()))
+    if args.interval < 10:
+        raise SystemExit("--interval must be at least 10 seconds.")
+
+    session = build_session(args.user_agent)
 
     print(f"Watching {url}")
-    print(f"Polling every {args.interval} seconds")
+    print(f"Polling HN updates every {args.interval} seconds")
 
     try:
-        current = fetch_snapshot(url, timeout=args.timeout, user_agent=args.user_agent)
-    except requests.RequestException as exc:
+        current = fetch_item_snapshot(session, item_id, timeout=args.timeout)
+    except (requests.RequestException, ValueError) as exc:
         print(f"Initial fetch failed: {exc}", file=sys.stderr)
         return 1
 
@@ -281,10 +263,26 @@ def run() -> int:
 
     while True:
         time.sleep(args.interval)
+
         try:
-            latest = fetch_snapshot(url, timeout=args.timeout, user_agent=args.user_agent)
+            changed_items = fetch_changed_items(session, timeout=args.timeout)
         except requests.RequestException as exc:
-            print(f"Fetch failed: {exc}", file=sys.stderr)
+            delay = next_backoff_seconds(exc, args.interval)
+            print(f"Updates fetch failed: {exc}. Backing off for {delay} seconds.", file=sys.stderr)
+            time.sleep(delay)
+            continue
+
+        if item_id not in changed_items:
+            if args.show_unchanged:
+                print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] No change: {status_line(current)}")
+            continue
+
+        try:
+            latest = fetch_item_snapshot(session, item_id, timeout=args.timeout)
+        except (requests.RequestException, ValueError) as exc:
+            delay = next_backoff_seconds(exc, args.interval)
+            print(f"Item fetch failed: {exc}. Backing off for {delay} seconds.", file=sys.stderr)
+            time.sleep(delay)
             continue
 
         changes = describe_changes(current, latest)
@@ -294,7 +292,7 @@ def run() -> int:
             print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {latest.title}")
             print(message)
         elif args.show_unchanged:
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] No change: {status_line(latest)}")
+            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] No count increase: {status_line(latest)}")
 
         current = latest
 
